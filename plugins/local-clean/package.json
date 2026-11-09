@@ -1,0 +1,28 @@
+{
+  "name": "local-clean",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "dshGo": {
+    "v": 1,
+    "title": { "zh": "清理管家", "en": "Clean" },
+    "icon": "storage",
+    "contributes": {
+      "composer.strip": [
+        { "id": "clean-strip", "icon": "storage", "panel": "clean" }
+      ],
+      "panels": [
+        { "id": "clean", "title": { "zh": "清理管家", "en": "Clean" }, "icon": "storage", "placement": ["session.tab", "features"] }
+      ]
+    }
+  }
+}

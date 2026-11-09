@@ -1,0 +1,5 @@
+node_modules/
+*.log
+.cleaner-trash/
+snapshot.json
+plan.json
