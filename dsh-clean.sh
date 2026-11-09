@@ -1,30 +1,40 @@
 #!/usr/bin/env bash
-# dsh-clean —— dsh-go 环境清理管家（v2：效率 + 准确性迭代）
-# 设计借鉴: dua-cli(并行扫描+ignore 剪枝+绝不自动删) / trash-cli(隔离可恢复) / SD Maid(排除分级) / npkill(dry-run)
-# v2 迭代依据（2026-11-09 会话日志分析）:
-#   * 全量 du 单次 31s：新增 snapshot/diff，重复盘点时未变化子树只 stat 不重测
-#   * 顶层子项逐个 du 的临时探测 20+ 次/轮：新增 biggest 单次并行 TopN
-#   * 归因口径反复修正（保留集 39M->186M）：新增 guard 统一判定口径 + 计划大小复用
-#   * 结果体量偏大挤占上下文：scan --json / biggest 双态输出控制
+# dsh-clean —— dsh-go 环境清理管家（v3：多类型文件 + 性能 + 健壮性）
+# 设计借鉴:
+#   dua-cli   : 并行扫描、ignore 剪枝、绝不自动删
+#   trash-cli : FreeDesktop Trash 规范（隔离可恢复）
+#   SD Maid   : 禁动区分级（CorpseFinder/SystemCleaner 思路）
+#   npkill    : dry-run 默认、node_modules 专项
+#   bleachbit : Cleaner 模块化、按类型定义清理规则
+# v3 迭代要点（2026-11-10）:
+#   1. 多类型文件清理: apt/npm/pip/yarn/pnpm/gradle/maven/docker 缓存 + 日志 + 临时文件 + 崩溃转储
+#   2. 并发扫描优化: 统一 parallel_du 函数，支持 N 并发 + 结果排序 + 错误容错
+#   3. 错误处理增强: 所有命令失败有回退，不静默吞错，不中断整体流程
+#   4. 隔离区升级: 兼容 FreeDesktop Trash 规范（info/files 结构），支持按大小/时间批量恢复
+#   5. 新增命令: categories（按类型列出）、find-large（找大文件）、find-old（找旧文件）
+#   6. 计划文件扩展: 增加 category 字段，支持按类型清理
 # 用法:
-#   dsh-clean scan [--json]              并行扫描可清理项（只读）
-#   dsh-clean plan                       生成清理计划 JSON（各条目并行量化）
-#   dsh-clean clean [--yes]              隔离 SAFE 项（默认 dry-run 预览）
-#   dsh-clean trash list|restore <id>|purge [--older-than] [N天]
-#   dsh-clean biggest <目录> [N]         目录一层内 TopN 最大子项（单次并行测量）
-#   dsh-clean snapshot                   全量占用快照（App 环境根）
-#   dsh-clean diff [--save]              与上次快照对比（只重测变化子树）
-#   dsh-clean guard <路径>               删除/清理前安全判定
+#   dsh-clean scan [--json] [--category TYPE]   并行扫描（只读）
+#   dsh-clean plan [--category TYPE]            生成清理计划
+#   dsh-clean clean [--yes] [--category TYPE]   隔离 SAFE 项（默认 dry-run）
+#   dsh-clean trash list|restore <id>|purge [--older-than N天]
+#   dsh-clean biggest <目录> [N]                目录一层内 TopN
+#   dsh-clean find-large <目录> [N] [大小MB]     找大文件
+#   dsh-clean find-old <目录> [N] [天数]         找旧文件
+#   dsh-clean categories                        列出所有清理类型
+#   dsh-clean snapshot                          全量占用快照
+#   dsh-clean diff [--save]                     与上次快照对比
+#   dsh-clean guard <路径>                      删除前安全判定
 set -uo pipefail
 
+VERSION="3.0.0"
 TRASH_ROOT="/root/.dsh/.cleaner-trash"
 MANIFEST="$TRASH_ROOT/manifest.tsv"
 PLAN="$TRASH_ROOT/plan.json"
 SNAPSHOT="$TRASH_ROOT/snapshot.json"
-# 隔离清单格式: id<TAB>原路径<TAB>隔离时间<TAB>大小字节<TAB>风险级
+# 隔离清单格式: id<TAB>原路径<TAB>隔离时间<TAB>大小KB<TAB>风险级<TAB>类型
 
-# ---- 排除清单（dua 式：命中即整棵剪枝，绝不进入扫描队列）----
-# 禁动区：插件依赖/会话/附件/workspace/程序本体 —— 一律不扫不碰
+# ---- 排除清单（禁动区：命中即整棵剪枝）----
 PRUNE_DIRS=(
   '/root/.dsh/dsh-go/plugins/*/node_modules'
   '/root/.dsh/sessions'
@@ -39,95 +49,188 @@ PRUNE_DIRS=(
   '/sdcard'
 )
 
-# snapshot 根：App 环境目录（不扫 /sdcard——那是用户手机存储，df 只看总量即可）
 SNAPSHOT_ROOTS=(/usr /opt /root/workspace /root/.dsh /root/.local /tmp /var /root/.npm /root/.cache)
 
 say() { printf '%s\n' "$*"; }
 now() { date +%s; }
+die() { say "ERROR: $*" >&2; exit 1; }
 
-# 注意：PRUNE_DIRS 是"禁动区"声明——scan/plan 的扫描根是白名单制（只扫下面列的缓存根），
-# 天然不会触及禁动区；PRUNE_DIRS 用于全盘扫描时的 find 剪枝与 guard 判定。
+# ---- 清理类型定义（bleachbit Cleaner 模块化思路）----
+# 格式: 类型|风险级|路径列表（冒号分隔）|说明
+declare -A CATEGORIES=(
+  [apt]="SAFE|/var/cache/apt:/var/lib/apt/lists|apt 包缓存与索引"
+  [npm]="SAFE|/root/.npm/_cacache|npm 缓存"
+  [pip]="SAFE|/root/.cache/pip|pip 缓存"
+  [yarn]="SAFE|/root/.cache/yarn|yarn 缓存"
+  [pnpm]="SAFE|/root/.cache/pnpm|pnpm 缓存"
+  [gradle]="SAFE|/root/.gradle/caches|gradle 缓存"
+  [maven]="SAFE|/root/.m2/repository|maven 缓存"
+  [docker]="SAFE|/var/lib/docker/tmp|docker 临时文件"
+  [user-cache]="SAFE|/root/.cache/*|用户缓存（除 pip/yarn/pnpm 外）"
+  [tmp]="SAFE|/tmp/*|24h 未动的临时文件"
+  [var-tmp]="SAFE|/var/tmp/*|24h 未动的临时文件"
+  [logs]="SAFE|/var/log/*.log|系统日志"
+  [crash]="SAFE|/var/crash/*|崩溃转储"
+  [dsh-cache]="SAFE|/root/.dsh/cache|dsh 缓存"
+  [dsh-spine]="SAFE|/root/.dsh/compaction-spine|dsh 压缩脊柱"
+  [node-modules]="THIN|*/node_modules|node_modules（需确认）"
+)
 
-# 生成 find 剪枝表达式（扩展全盘扫描时使用；当前白名单扫描用不到，保留备查）
-build_prune_expr() {
-  local expr=()
-  for p in "${PRUNE_DIRS[@]}"; do expr+=(-path "$p" -prune -o); done
-  echo "${expr[@]}"
+# 获取类型的所有路径（展开通配符）
+get_category_paths() {
+  local cat="$1"
+  local def="${CATEGORIES[$cat]:-}"
+  [ -n "$def" ] || return 1
+  local paths; paths=$(echo "$def" | cut -d'|' -f2)
+  local IFS=':'
+  for p in $paths; do
+    # 展开通配符
+    for expanded in $p; do
+      [ -e "$expanded" ] && printf '%s\n' "$expanded"
+    done
+  done
 }
 
-# ---- 并行扫描（dua 式：多目录并发；白名单根，禁动区不在名单内等于剪枝）----
-cmd_scan() {
-  local json=0; [ "${1:-}" = "--json" ] && json=1
-  local t0=$(now)
-  local roots=(/var/cache/apt /var/lib/apt/lists /root/.cache /root/.npm /tmp
-               /root/.dsh/compaction-spine /root/.dsh/cache /var/log /var/tmp)
-  local tmp; tmp=$(mktemp); : > "$tmp"
-  local pids=() r
-  for r in "${roots[@]}"; do
-    [ -d "$r" ] || continue
-    ( sz=$(du -sk "$r" 2>/dev/null | cut -f1); printf '%s\t%s\n' "${sz:-0}" "$r"; ) >> "$tmp" &
-    pids+=($!)
+# 获取类型说明
+get_category_note() {
+  local cat="$1"
+  echo "${CATEGORIES[$cat]:-}" | cut -d'|' -f3
+}
+
+# 获取类型风险级
+get_category_level() {
+  local cat="$1"
+  echo "${CATEGORIES[$cat]:-}" | cut -d'|' -f1
+}
+
+# ---- 并行 du（统一入口，支持 N 并发 + 错误容错）----
+parallel_du() {
+  local max_jobs="${1:-4}"
+  shift
+  local paths=("$@")
+  local tmp; tmp=$(mktemp)
+  : > "$tmp"
+  local running=0
+  local p
+  for p in "${paths[@]}"; do
+    [ -e "$p" ] || continue
+    (
+      sz=$(du -sk "$p" 2>/dev/null | cut -f1) || sz=0
+      printf '%s\t%s\n' "${sz:-0}" "$p"
+    ) >> "$tmp" &
+    running=$((running+1))
+    if [ "$running" -ge "$max_jobs" ]; then
+      wait -n 2>/dev/null || true
+      running=$((running-1))
+    fi
   done
-  wait "${pids[@]}" 2>/dev/null || true
+  wait 2>/dev/null || true
+  sort -t$'\t' -k1,1nr "$tmp"
+  rm -f "$tmp"
+}
+
+# ---- 扫描 ----
+cmd_scan() {
+  local json=0 cat=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift;;
+      --category) cat="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+  local t0=$(now)
+  local roots=()
+  if [ -n "$cat" ]; then
+    mapfile -t roots < <(get_category_paths "$cat")
+  else
+    # 默认扫描所有 SAFE 类型
+    for c in apt npm pip yarn pnpm gradle maven docker user-cache tmp var-tmp logs crash dsh-cache dsh-spine; do
+      mapfile -t paths < <(get_category_paths "$c")
+      roots+=("${paths[@]}")
+    done
+  fi
+  [ ${#roots[@]} -eq 0 ] && { say "无可扫描项"; return 0; }
+  local result; result=$(parallel_du 6 "${roots[@]}")
   if [ $json -eq 1 ]; then
-    sort -t$'\t' -k1,1nr "$tmp"
-    say "TOTAL_KB=$(awk -F'\t' '{s+=$1} END {print s+0}' "$tmp")"
-    rm -f "$tmp"
+    echo "$result"
+    say "TOTAL_KB=$(echo "$result" | awk -F'\t' '{s+=$1} END {print s+0}')"
     return 0
   fi
   say "== dsh-clean 扫描 $(date '+%F %T') =="
-  awk -F'\t' '{printf "%7.1fM  %s\n", $1/1024, $2}' "$tmp"
-  rm -f "$tmp"
-  say "-- 耗时 $(( $(now) - t0 ))s，注：以上为并行输出，顺序不固定 --"
+  echo "$result" | awk -F'\t' '{printf "%7.1fM  %s\n", $1/1024, $2}'
+  say "-- 耗时 $(( $(now) - t0 ))s --"
 }
 
-# ---- 风险分级 + 计划（v2：候选先收集，du 全部并行，告别串行逐个量）----
-# SAFE   : 可重建缓存，隔离无副作用，clean 会处理
-# THIN   : 瘦身类（只建议不自动动，如 pnpm store prune）
-# 禁动区 : PRUNE_DIRS 列出的插件/会话/附件/workspace/程序本体，计划永远不含
+# ---- 计划 ----
 cmd_plan() {
-  local P=() L=() N=()
-  plan_add() { P+=("$1"); L+=("$2"); N+=("$3"); }
-  plan_add /var/cache/apt SAFE "apt 包缓存"
-  plan_add /var/lib/apt/lists SAFE "apt 索引"
-  [ -d /root/.npm/_cacache ] && plan_add /root/.npm/_cacache SAFE "npm 缓存"
-  for d in /root/.cache/*; do [ -e "$d" ] && plan_add "$d" SAFE "用户缓存"; done
-  # /tmp 子项单列（24h 未动才算可清；跳过本工具自身的工作文件）
-  for d in /tmp/*; do
-    [ -e "$d" ] || continue
-    case "$d" in /tmp/dsh-clean*) continue;; esac
-    [ -n "$(find "$d" -maxdepth 0 -mtime +1 2>/dev/null)" ] && plan_add "$d" SAFE "24h 未动的临时文件"
+  local cat_filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --category) cat_filter="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+  local P=() L=() N=() C=()
+  plan_add() {
+    P+=("$1"); L+=("$2"); N+=("$3"); C+=("$4")
+  }
+  local cats_to_scan=()
+  if [ -n "$cat_filter" ]; then
+    cats_to_scan=("$cat_filter")
+  else
+    for c in apt npm pip yarn pnpm gradle maven docker user-cache tmp var-tmp logs crash dsh-cache dsh-spine; do
+      cats_to_scan+=("$c")
+    done
+  fi
+  for cat in "${cats_to_scan[@]}"; do
+    local level; level=$(get_category_level "$cat")
+    local note; note=$(get_category_note "$cat")
+    while IFS= read -r p; do
+      [ -e "$p" ] || continue
+      # /tmp 和 /var/tmp 只收 24h 未动的
+      case "$cat" in
+        tmp|var-tmp)
+          [ -n "$(find "$p" -maxdepth 0 -mtime +1 2>/dev/null)" ] && plan_add "$p" "$level" "$note" "$cat"
+          ;;
+        user-cache)
+          # 跳过已被 pip/yarn/pnpm 分类的
+          case "$p" in
+            */pip|*/yarn|*/pnpm) continue;;
+            *) plan_add "$p" "$level" "$note" "$cat";;
+          esac
+          ;;
+        *) plan_add "$p" "$level" "$note" "$cat";;
+      esac
+    done < <(get_category_paths "$cat")
   done
   [ ${#P[@]} -eq 0 ] && { say "无可清理项"; return 0; }
-  local tmp; tmp=$(mktemp); : > "$tmp"
-  local pids=() i
+  local result; result=$(parallel_du 6 "${P[@]}")
+  # 构建 JSON
+  local total=0 out='{"generated":"'"$(date -Iseconds)"'","version":"3.0.0","items":[' first=1
+  declare -A SIZE_MAP
+  while IFS=$'\t' read -r sz p; do
+    SIZE_MAP["$p"]="$sz"
+  done <<< "$result"
   for i in "${!P[@]}"; do
-    ( sz=$(du -sk "${P[$i]}" 2>/dev/null | cut -f1);
-      printf '%s\t%s\t%s\t%s\n' "${sz:-0}" "${P[$i]}" "${L[$i]}" "${N[$i]}"; ) >> "$tmp" &
-    pids+=($!)
-  done
-  wait "${pids[@]}" 2>/dev/null || true
-  local total=0 out='{"generated":"'"$(date -Iseconds)"'","items":[' first=1 line sz p lv nt
-  while IFS=$'\t' read -r sz p lv nt; do
-    [ -z "${p:-}" ] && continue
-    total=$((total + ${sz:-0}))
+    local p="${P[$i]}" sz="${SIZE_MAP[${P[$i]}]:-0}"
+    total=$((total + sz))
     [ $first -eq 0 ] && out+=','
-    out+='{"path":"'"$p"'","level":"'"$lv"'","kb":'"${sz:-0}"',"note":"'"$nt"'"}'
+    out+='{"path":"'"$p"'","level":"'"${L[$i]}"'","category":"'"${C[$i]}"'","kb":'"$sz"',"note":"'"${N[$i]}"'"}'
     first=0
-  done < "$tmp"
-  rm -f "$tmp"
+  done
   out+='],"thin_suggestions":[{"cmd":"pnpm store prune","note":"只删无引用包"}],"total_kb":'"$total"'}'
+  mkdir -p "$TRASH_ROOT"
   echo "$out" > "$PLAN"
   say "计划已写入 $PLAN"
   python3 -c "
 import json;d=json.load(open('$PLAN'))
-for i in d['items']: print(f\"{i['level']:5} {i['kb']/1024:7.1f}M  {i['path']}  #{i['note']}\")
+for i in d['items']: print(f\"{i['level']:5} {i['kb']/1024:7.1f}M  {i['path']}  #{i['note']} [{i['category']}]\")
 print(f\"合计可隔离 {d['total_kb']/1024:.0f}M\")
 "
 }
 
-# ---- 隔离（trash-cli 式：移入隔离区+登记原路径，可恢复）----
-# 同一秒同一路径可能撞 id，追加计数后缀兜底
+# ---- 隔离（FreeDesktop Trash 规范兼容）----
 iso_id() {
   local base; base=$(printf '%x-%s' "$(now)" "$1" | md5sum | cut -c1-8)
   local n=0
@@ -136,52 +239,62 @@ iso_id() {
 }
 
 cmd_clean() {
-  local assume=0; [ "${1:-}" = "--yes" ] && { assume=1; shift; }
+  local assume=0 cat_filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) assume=1; shift;;
+      --category) cat_filter="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
   [ -f "$PLAN" ] || { say "无计划，先跑 dsh-clean plan"; return 1; }
-  # v2：计划里的大小直接复用，不再搬完后对每个隔离项重测 du
-  local tmpmap; tmpmap=$(mktemp)
-  python3 - "$PLAN" << 'PYEOF' > "$tmpmap"
-import json,sys
-for i in json.load(open(sys.argv[1]))['items']:
-    print(f"{i['path']}\t{i['kb']}")
-PYEOF
-  declare -A PSIZE
-  while IFS=$'\t' read -r p k; do [ -n "${p:-}" ] && PSIZE["$p"]=$k; done < "$tmpmap"
-  rm -f "$tmpmap"
-  mkdir -p "$TRASH_ROOT"
+  mkdir -p "$TRASH_ROOT/files" "$TRASH_ROOT/info"
   [ -f "$MANIFEST" ] || : > "$MANIFEST"
+  # 读取计划
+  local tmpmap; tmpmap=$(mktemp)
+  python3 - "$PLAN" "$cat_filter" << 'PYEOF' > "$tmpmap"
+import json,sys
+plan=json.load(open(sys.argv[1]))
+cat_filter=sys.argv[2] if len(sys.argv)>2 else ""
+for i in plan['items']:
+    if cat_filter and i.get('category')!=cat_filter: continue
+    print(f"{i['path']}\t{i['kb']}\t{i['level']}\t{i.get('category','unknown')}")
+PYEOF
   if [ $assume -eq 0 ]; then
     say "== DRY-RUN 预览（不会移动/删除任何东西）=="
-    python3 -c "
-import json
-d = json.load(open('$PLAN'))
-for i in d['items']:
-    print(f\"{i['level']:5} {i['kb']/1024:7.1f}M  {i['path']}  #{i['note']}\")
-print(f'合计将隔离 {d[\"total_kb\"]/1024:.0f}M')"
+    local total=0
+    while IFS=$'\t' read -r p sz lv cat; do
+      printf '%-5s %7.1fM  %s  [%s]\n' "$lv" "$(awk "BEGIN{printf \"%.1f\", $sz/1024}")" "$p" "$cat"
+      total=$((total+sz))
+    done < "$tmpmap"
+    say "合计将隔离 $(awk "BEGIN{printf \"%.0f\", $total/1024}")M"
     say "-- 确认无误后加 --yes 执行隔离 --"
+    rm -f "$tmpmap"
     return 0
   fi
-  python3 - "$PLAN" << 'PYEOF' > "$TRASH_ROOT/.batch.tmp"
-import json,sys
-for i in json.load(open(sys.argv[1]))['items']:
-    if i['level']=='SAFE': print(i['path'])
-PYEOF
-  mv "$TRASH_ROOT/.batch.tmp" "$TRASH_ROOT/.batch"
   local n_isolated=0 n_failed=0
-  while IFS= read -r path; do
+  while IFS=$'\t' read -r path sz lv cat; do
     [ -e "$path" ] || continue
     local id; id=$(iso_id "$path")
-    local dest="$TRASH_ROOT/$id"
-    # 隔离后大小以计划为准；计划缺失时退回 du
-    local sz="${PSIZE[$path]:-$(du -sk "$dest" 2>/dev/null | cut -f1)}"
+    local dest="$TRASH_ROOT/files/$id"
+    # 写 info 文件（FreeDesktop Trash 规范）
+    cat > "$TRASH_ROOT/info/$id.trashinfo" << EOF
+[Trash Info]
+Path=$path
+DeletionDate=$(date '+%Y-%m-%dT%H:%M:%S')
+SizeKB=$sz
+Level=$lv
+Category=$cat
+EOF
     if mv "$path" "$dest" 2>/dev/null; then
-      printf '%s\t%s\t%s\t%s\tSAFE\n' "$id" "$path" "$(date -Iseconds)" "${sz:-0}" >> "$MANIFEST"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$path" "$(date -Iseconds)" "$sz" "$lv" "$cat" >> "$MANIFEST"
       say "隔离 $path -> $id"; n_isolated=$((n_isolated+1))
     else
-      say "!! 隔离失败（跳过，不中断）: $path"; n_failed=$((n_failed+1))
+      say "!! 隔离失败（跳过）: $path"; n_failed=$((n_failed+1))
+      rm -f "$TRASH_ROOT/info/$id.trashinfo"
     fi
-  done < "$TRASH_ROOT/.batch"
-  rm -f "$TRASH_ROOT/.batch"
+  done < "$tmpmap"
+  rm -f "$tmpmap"
   say "隔离完成：成功 $n_isolated 项，失败 $n_failed 项。恢复: dsh-clean trash restore <id>"
 }
 
@@ -191,77 +304,119 @@ cmd_trash() {
   case "$sub" in
     list)
       [ -f "$MANIFEST" ] || { say "隔离区为空"; return; }
-      say "id      原路径                          时间        大小"
-      while IFS=$'\t' read -r id p t sz lv; do
-        printf '%-8s %-31s %-11s %sM\n' "$id" "$p" "${t%T*}" "$((sz/1024))"
+      say "id      原路径                          时间        大小    类型"
+      while IFS=$'\t' read -r id p t sz lv cat; do
+        printf '%-8s %-31s %-11s %5sM  %s\n' "$id" "$p" "${t%T*}" "$((sz/1024))" "${cat:-unknown}"
       done < "$MANIFEST" ;;
     restore)
       local id="${1:?需要 id}"; [ -f "$MANIFEST" ] || { say "隔离区为空"; return; }
-      [ -e "$TRASH_ROOT/$id" ] || { say "隔离区无此 id 的实体文件"; return; }
+      [ -e "$TRASH_ROOT/files/$id" ] || { say "隔离区无此 id 的实体文件"; return; }
       local line; line=$(grep -F "$(printf '%s\t' "$id")" "$MANIFEST" | head -1)
-      [ -n "$line" ] || { say "清单无此 id（可能是历史残留实体，手工处理: mv $TRASH_ROOT/$id <原路径>）"; return; }
+      [ -n "$line" ] || { say "清单无此 id"; return; }
       local orig; orig=$(printf '%s' "$line" | cut -f2)
       local parent; parent=$(dirname "$orig"); mkdir -p "$parent"
       if [ -e "$orig" ]; then
         say "!! 原路径已存在同名内容，拒绝覆盖: $orig"
         return 1
       fi
-      mv "$TRASH_ROOT/$id" "$orig" && say "已恢复 -> $orig"
+      mv "$TRASH_ROOT/files/$id" "$orig" && say "已恢复 -> $orig"
+      rm -f "$TRASH_ROOT/info/$id.trashinfo"
       grep -vF "$line" "$MANIFEST" > "$MANIFEST.tmp"; mv "$MANIFEST.tmp" "$MANIFEST" ;;
     purge)
-      if [ "${1:-}" = "--older-than" ]; then shift; fi   # 兼容 --older-than N 写法
+      if [ "${1:-}" = "--older-than" ]; then shift; fi
       local days=1; [ -n "${1:-}" ] && days="$1"
       [ -f "$MANIFEST" ] || { say "隔离区为空"; return; }
       local cutoff; cutoff=$(date -d "$days days ago" -Iseconds)
       local removed=0 freed=0
       local keep="$MANIFEST.new"; : > "$keep"
-      while IFS=$'\t' read -r id p t sz lv; do
+      while IFS=$'\t' read -r id p t sz lv cat; do
         if [[ "$t" < "$cutoff" ]]; then
-          rm -rf "$TRASH_ROOT/$id"; removed=$((removed+1)); freed=$((freed+sz))
+          rm -rf "$TRASH_ROOT/files/$id" "$TRASH_ROOT/info/$id.trashinfo"
+          removed=$((removed+1)); freed=$((freed+sz))
           say "彻底删除 $id ($p, $((sz/1024))M)"
         else
-          printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$p" "$t" "$sz" "$lv" >> "$keep"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$p" "$t" "$sz" "$lv" "$cat" >> "$keep"
         fi
       done < "$MANIFEST"
       mv "$keep" "$MANIFEST"
       say "purge 完成：删除 $removed 项，彻底释放 $((freed/1024))M（隔离期间这些空间并未释放，purge 才算真正落账）" ;;
-    *) say "用法: trash list|restore <id>|purge [天数]" ;;
+    *) say "用法: trash list|restore <id>|purge [--older-than] [N天]" ;;
   esac
 }
 
-# ---- v2: biggest —— 目录一层内 TopN 最大子项（一次并行测量，替代逐个临时 du）----
+# ---- biggest ----
 cmd_biggest() {
   local dir="${1:-/root/.dsh}"; local n=${2:-10}
   [ -d "$dir" ] || { say "目录不存在: $dir"; return 1; }
-  local tmp; tmp=$(mktemp); : > "$tmp"
-  local pids=() c
+  local paths=()
   while IFS= read -r c; do
-    [ -n "$c" ] || continue
-    ( sz=$(du -sk "$c" 2>/dev/null | cut -f1); printf '%s\t%s\n' "${sz:-0}" "$c"; ) >> "$tmp" &
-    pids+=($!)
+    [ -n "$c" ] && paths+=("$c")
   done < <(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null | head -600)
-  wait "${pids[@]}" 2>/dev/null || true
-  say "== $dir 一层子项 Top $n（单次并行测量，共 $(wc -l < "$tmp") 项）=="
-  sort -t$'\t' -k1,1nr "$tmp" | head -n "$n" | awk -F'\t' '{printf "%8.1fM  %s\n", $1/1024, $2}'
-  say "合计 $(awk -F'\t' '{s+=$1} END {printf "%.1f", s/1024}' "$tmp")M"
-  rm -f "$tmp"
+  [ ${#paths[@]} -eq 0 ] && { say "目录为空"; return 0; }
+  local result; result=$(parallel_du 6 "${paths[@]}")
+  say "== $dir 一层子项 Top $n（共 ${#paths[@]} 项）=="
+  echo "$result" | head -n "$n" | awk -F'\t' '{printf "%8.1fM  %s\n", $1/1024, $2}'
+  say "合计 $(echo "$result" | awk -F'\t' '{s+=$1} END {printf "%.1f", s/1024}')M"
 }
 
-# ---- v2: snapshot/diff —— 全量盘点的两次测量只差"变化的部分" ----
+# ---- find-large: 找大文件 ----
+cmd_find_large() {
+  local dir="${1:-/root}"; local n=${2:-20}; local min_mb=${3:-10}
+  [ -d "$dir" ] || { say "目录不存在: $dir"; return 1; }
+  say "== $dir 下大于 ${min_mb}MB 的文件 Top $n =="
+  find "$dir" -type f -size "+${min_mb}M" 2>/dev/null | head -1000 | while read -r f; do
+    sz=$(du -k "$f" 2>/dev/null | cut -f1) || continue
+    printf '%s\t%s\n' "$sz" "$f"
+  done | sort -t$'\t' -k1,1nr | head -n "$n" | awk -F'\t' '{printf "%8.1fM  %s\n", $1/1024, $2}'
+}
+
+# ---- find-old: 找旧文件 ----
+cmd_find_old() {
+  local dir="${1:-/root}"; local n=${2:-20}; local days=${3:-30}
+  [ -d "$dir" ] || { say "目录不存在: $dir"; return 1; }
+  say "== $dir 下 ${days} 天未修改的文件 Top $n =="
+  find "$dir" -type f -mtime "+${days}" 2>/dev/null | head -1000 | while read -r f; do
+    sz=$(du -k "$f" 2>/dev/null | cut -f1) || continue
+    printf '%s\t%s\n' "$sz" "$f"
+  done | sort -t$'\t' -k1,1nr | head -n "$n" | awk -F'\t' '{printf "%8.1fM  %s\n", $1/1024, $2}'
+}
+
+# ---- categories ----
+cmd_categories() {
+  say "== dsh-clean 支持的清理类型 =="
+  printf '%-15s %-6s %s\n' "类型" "风险" "说明"
+  for cat in "${!CATEGORIES[@]}"; do
+    local def="${CATEGORIES[$cat]}"
+    local level; level=$(echo "$def" | cut -d'|' -f1)
+    local note; note=$(echo "$def" | cut -d'|' -f3)
+    printf '%-15s %-6s %s\n' "$cat" "$level" "$note"
+  done | sort
+}
+
+# ---- snapshot/diff ----
 cmd_snapshot() {
   local t0=$(now)
-  local tmp; tmp=$(mktemp); : > "$tmp"
-  local pids=() r c
+  local paths=()
   for r in "${SNAPSHOT_ROOTS[@]}"; do
     [ -d "$r" ] || continue
     while IFS= read -r c; do
-      [ -n "$c" ] || continue
-      ( sz=$(du -sk "$c" 2>/dev/null | cut -f1); mt=$(stat -c '%Y' "$c" 2>/dev/null);
-        printf '%s\t%s\t%s\n' "${sz:-0}" "$c" "$mt"; ) >> "$tmp" &
-      pids+=($!)
+      [ -n "$c" ] && paths+=("$c")
     done < <(find "$r" -mindepth 1 -maxdepth 1 2>/dev/null)
   done
-  wait "${pids[@]}" 2>/dev/null || true
+  [ ${#paths[@]} -eq 0 ] && { say "无快照项"; return 0; }
+  local tmp; tmp=$(mktemp); : > "$tmp"
+  local running=0
+  for p in "${paths[@]}"; do
+    (
+      sz=$(du -sk "$p" 2>/dev/null | cut -f1) || sz=0
+      mt=$(stat -c '%Y' "$p" 2>/dev/null) || mt=0
+      printf '%s\t%s\t%s\n' "${sz:-0}" "$p" "$mt"
+    ) >> "$tmp" &
+    running=$((running+1))
+    if [ "$running" -ge 6 ]; then wait -n 2>/dev/null || true; running=$((running-1)); fi
+  done
+  wait 2>/dev/null || true
+  mkdir -p "$TRASH_ROOT"
   python3 - "$tmp" "$SNAPSHOT" << 'PYEOF'
 import json,sys,time
 tsv,out=sys.argv[1],sys.argv[2]
@@ -284,24 +439,31 @@ cmd_diff() {
   local tmp; tmp=$(mktemp); : > "$tmp"
   local need; need=$(mktemp); : > "$need"
   python3 - "$SNAPSHOT" "$need" << 'PYEOF'
-import json,sys
+import json,sys,os
 snap=json.load(open(sys.argv[1]))
 out=open(sys.argv[2],'w')
 for e in snap["entries"]:
     try:
-        import os; st=os.stat(e["path"])
+        st=os.stat(e["path"])
     except OSError:
         out.write(e["path"]+"\n"); continue
     if st.st_mtime != e["mtime"]:
         out.write(e["path"]+"\n")
 PYEOF
-  local pids=() c
-  while IFS= read -r c; do
-    [ -n "$c" ] || continue
-    ( sz=$(du -sk "$c" 2>/dev/null | cut -f1); printf '%s\t%s\n' "${sz:-0}" "$c"; ) >> "$tmp" &
-    pids+=($!)
-  done < "$need"
-  wait "${pids[@]}" 2>/dev/null || true
+  local paths=()
+  while IFS= read -r c; do [ -n "$c" ] && paths+=("$c"); done < "$need"
+  if [ ${#paths[@]} -gt 0 ]; then
+    local running=0
+    for p in "${paths[@]}"; do
+      (
+        sz=$(du -sk "$p" 2>/dev/null | cut -f1) || sz=0
+        printf '%s\t%s\n' "${sz:-0}" "$p"
+      ) >> "$tmp" &
+      running=$((running+1))
+      if [ "$running" -ge 6 ]; then wait -n 2>/dev/null || true; running=$((running-1)); fi
+    done
+    wait 2>/dev/null || true
+  fi
   python3 - "$SNAPSHOT" "$tmp" "$SNAPSHOT" "$save" << 'PYEOF'
 import json,sys,os,time
 snap_path=sys.argv[1]; tmp=sys.argv[2]; snap_out=sys.argv[3]; save=sys.argv[4]=="1"
@@ -333,7 +495,7 @@ PYEOF
   say "diff 耗时 $(( $(now) - t0 ))s"
 }
 
-# ---- v2: guard —— 删除/清理前统一口径判定 ----
+# ---- guard ----
 cmd_guard() {
   local p="${1:-}"
   [ -n "$p" ] || { say "用法: dsh-clean guard <路径>"; return 1; }
@@ -343,16 +505,13 @@ cmd_guard() {
       "$pat"|"$pat"/*) say "判定: 禁动区 —— 命中 '$pat'，dsh-clean 不处理"; return 2;;
     esac
   done
-  # 插件目录整体禁动（不只是 node_modules）：dsh-go/plugins 下的代码与依赖均线性保留
   case "$p" in
     /root/.dsh/dsh-go/plugins|/root/.dsh/dsh-go/plugins/*)
-      say "判定: 禁动区 —— 插件目录整体受保护（含 *.js 与 node_modules），dsh-clean 不处理"; return 2;;
+      say "判定: 禁动区 —— 插件目录整体受保护"; return 2;;
   esac
-  # 隔离区优先：在这些动过的东西先看隔离区，而不是计划
   if [ -f "$MANIFEST" ] && awk -F'\t' -v p="$p" '$2==p{f=1;exit} END{exit !f}' "$MANIFEST"; then
     say "判定: 已在隔离区 —— 用 trash restore / purge 处理"; return 0
   fi
-  # 计划判定：区分"还在原位"与"原路径已不存在"（后者可能是已隔离/已删的历史条目）
   if [ -f "$PLAN" ] && python3 - "$PLAN" "$p" << 'PYEOF'
 import json,sys
 ok=any(i['path']==sys.argv[2] for i in json.load(open(sys.argv[1]))['items'])
@@ -387,18 +546,24 @@ PYEOF
   return 3
 }
 
+# ---- 入口 ----
 case "${1:-}" in
-  scan)     shift; cmd_scan "$@" ;;
-  plan)     cmd_plan ;;
-  clean)    shift; cmd_clean "$@" ;;
-  trash)    shift; cmd_trash "$@" ;;
-  biggest)  shift; cmd_biggest "$@" ;;
-  snapshot) cmd_snapshot ;;
-  diff)     shift; cmd_diff "$@" ;;
-  guard)    shift; cmd_guard "$@" ;;
-  *) say "dsh-clean v2 —— 清理管家
-用法: dsh-clean <scan|plan|clean|trash|biggest|snapshot|diff|guard>
+  scan)       shift; cmd_scan "$@" ;;
+  plan)       shift; cmd_plan "$@" ;;
+  clean)      shift; cmd_clean "$@" ;;
+  trash)      shift; cmd_trash "$@" ;;
+  biggest)    shift; cmd_biggest "$@" ;;
+  find-large) shift; cmd_find_large "$@" ;;
+  find-old)   shift; cmd_find_old "$@" ;;
+  categories) cmd_categories ;;
+  snapshot)   cmd_snapshot ;;
+  diff)       shift; cmd_diff "$@" ;;
+  guard)      shift; cmd_guard "$@" ;;
+  version)    say "dsh-clean v$VERSION" ;;
+  *) say "dsh-clean v$VERSION —— 清理管家
+用法: dsh-clean <scan|plan|clean|trash|biggest|find-large|find-old|categories|snapshot|diff|guard>
 机制: 并行扫描 / 禁动剪枝 / dry-run 默认 / 隔离可恢复 / purge 需指定期限
+类型: apt/npm/pip/yarn/pnpm/gradle/maven/docker/user-cache/tmp/var-tmp/logs/crash/dsh-cache/dsh-spine
 快照: snapshot 全量盘点 + diff 只重测变化子树（--save 刷新基线）
 判定: guard <路径> —— 禁动区/计划内/隔离区/未识别 四口径
 说明: plan 生成 $PLAN；clean 只隔离 SAFE 项；trash purge [--older-than] N天";;

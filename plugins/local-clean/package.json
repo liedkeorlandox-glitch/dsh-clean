@@ -1,9 +1,23 @@
 {
   "name": "local-clean",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
+  "description": "dsh-go 清理管家：多类型缓存扫描、隔离可恢复、大文件/旧文件查找",
   "type": "module",
   "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node ${DSH_HOME:-$HOME/.dsh}/skills/dsh-go-plugin/kit/bin/check.mjs . --load"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
